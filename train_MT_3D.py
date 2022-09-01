@@ -1,0 +1,261 @@
+import argparse
+import logging
+import os
+import random
+import shutil
+import sys
+import time
+
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from tensorboardX import SummaryWriter
+from torch.nn import BCEWithLogitsLoss
+from torch.nn.modules.loss import CrossEntropyLoss
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.utils import make_grid
+from tqdm import tqdm
+
+from dataloader.Lymphoma_3D_dataset import (Lymphoma_3D_SS, CenterCrop, RandomCrop,
+                                   RandomRotFlip, ToTensor, TwoStreamBatchSampler)
+
+from networks.net_factory_3d import net_factory_3d
+from utils import losses, metrics
+from val_3D import test_all_case
+
+
+basicdir = '/home/tju/Documents/HZS/PET_lymphoma/PET_lymphoma_PW/'
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument('--root_trainpath', type=str,
+                    default=basicdir + 'PET_lymphoma_TrainData_prior_120_128 64 64', help='Name of Experiment')
+parser.add_argument('--root_valpath', type=str,
+                    default=basicdir + 'PET_lymphoma_ValData_prior', help='Name of Experiment')
+parser.add_argument('--exp', type=str,
+                    default='PET_lymphoma_3D/SS_meanteacher', help='experiment_name')
+parser.add_argument('--model', type=str,
+                    default='VNet', help='model_name')
+parser.add_argument('--max_epochs', type=int,
+                    default=150, help='maximum epoch number to train')
+parser.add_argument('--deterministic', type=int,  default=1,
+                    help='whether use deterministic training')
+parser.add_argument('--base_lr', type=float,  default=0.01,
+                    help='segmentation network learning rate')
+parser.add_argument('--patch_size', type=list,  default=[128, 64, 64],  # D H W
+                    help='patch size of network input')
+parser.add_argument('--seed', type=int,  default=1337, help='random seed')
+
+# label and unlabel
+parser.add_argument('--batch_size', type=int, default=10,
+                    help='batch_size per gpu')
+parser.add_argument('--labeled_bs', type=int, default=5,
+                    help='labeled_batch_size per gpu')
+parser.add_argument('--labeled_num', type=int, default=60,
+                    help='labeled data')
+parser.add_argument('--total_num', type=int, default=120,
+                    help='total data')
+parser.add_argument('--num_classes', type=int, default=2,
+                    help='output_num_classes')
+parser.add_argument('--val_num', type=int, default=20,
+                    help='validation data')
+
+# costs
+parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')
+parser.add_argument('--consistency_type', type=str,
+                    default="mse", help='consistency_type')
+parser.add_argument('--consistency', type=float,
+                    default=0.1, help='consistency')
+parser.add_argument('--consistency_rampup', type=float,
+                    default=200.0, help='consistency_rampup')
+
+args = parser.parse_args()
+
+
+
+
+def worker_init_fn(worker_id):
+    random.seed(args.seed + worker_id)
+
+
+def sigmoid_rampup(current, rampup_length):
+    """Exponential rampup from https://arxiv.org/abs/1610.02242"""
+    if rampup_length == 0:
+        return 1.0
+    else:
+        current = np.clip(current, 0.0, rampup_length)
+        phase = 1.0 - current / rampup_length
+        return float(np.exp(-5.0 * phase * phase))
+
+
+def get_current_consistency_weight(epoch, epochs):
+    # Consistency ramp-up from https://arxiv.org/abs/1610.02242
+    return args.consistency * sigmoid_rampup(epoch, epochs)
+
+
+
+def update_ema_variables(model, ema_model, alpha, global_step):
+    # Use the true average until the exponential average is more correct
+    alpha = min(1 - 1 / (global_step + 1), alpha)
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
+
+
+def train(args, snapshot_path):
+    base_lr = args.base_lr
+    batch_size = args.batch_size
+    max_epochs = args.max_epochs
+
+    def create_model(ema=False):
+        # Network definition
+        net = net_factory_3d(net_type=args.model, in_chns=2, class_num=args.num_classes)
+        model = net.cuda()
+        if ema:
+            for param in model.parameters():
+                param.detach_()
+        return model
+
+    model = create_model()
+    ema_model = create_model(ema=True)
+
+    db_train = Lymphoma_3D_SS(base_dir=args.root_trainpath,
+                             split='train',
+                             # num=args.labeled_num,
+                             transform=transforms.Compose([
+                                 RandomRotFlip(),
+                                 RandomCrop(args.patch_size),
+                                 ToTensor(),
+                             ]))
+
+    labeled_idxs = list(range(0, args.labeled_num * 27))
+    unlabeled_idxs = list(range(args.labeled_num * 27, len(db_train)))
+    batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, batch_size, batch_size - args.labeled_bs)
+    trainloader = DataLoader(db_train, batch_sampler=batch_sampler,
+                             num_workers=16, pin_memory=True, worker_init_fn=worker_init_fn)
+
+    model.train()
+    ema_model.train()
+
+    optimizer = optim.SGD(model.parameters(), lr=base_lr,
+                          momentum=0.9, weight_decay=0.0001)
+    ce_loss = CrossEntropyLoss()
+    dice_loss = losses.DiceLoss(args.num_classes)
+
+    total_iter_num = max_epochs * len(trainloader)
+    writer = SummaryWriter(snapshot_path + '/log')
+    logging.info("{} iterations per epoch, total iterations number{} ".format(len(trainloader), total_iter_num))
+
+    iter_num = 0
+    best_performance = 0.0
+    iterator = tqdm(range(max_epochs), ncols=50)
+    for epoch_num in iterator:
+        for i_batch, sampled_batch in enumerate(trainloader):
+
+            volume_CT, volume_PET, label_batch = sampled_batch['image_CT'], sampled_batch['image_PET'], sampled_batch['label']
+            volume_batch = torch.cat((volume_CT, volume_PET), dim=1)
+            volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
+
+            unlabeled_volume_batch = volume_batch[args.labeled_bs:]
+
+            noise = torch.clamp(torch.randn_like(
+                unlabeled_volume_batch) * 0.1, -0.2, 0.2)
+            ema_inputs = unlabeled_volume_batch + noise
+
+            outputs = model(volume_batch)
+            outputs_soft = torch.softmax(outputs, dim=1)
+            with torch.no_grad():
+                ema_output = ema_model(ema_inputs)
+                ema_output_soft = torch.softmax(ema_output, dim=1)
+
+            loss_ce = ce_loss(outputs[:args.labeled_bs], label_batch[:args.labeled_bs][:])
+            loss_dice = dice_loss(
+                outputs_soft[:args.labeled_bs], label_batch[:args.labeled_bs].unsqueeze(1))
+            supervised_loss = 0.5 * (loss_dice + loss_ce)
+
+            consistency_weight = get_current_consistency_weight(iter_num, total_iter_num)
+            consistency_loss = torch.mean((outputs_soft[args.labeled_bs:] - ema_output_soft)**2)
+            loss = supervised_loss + consistency_weight * consistency_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+
+
+            # 学习率更新
+            lr_ = base_lr * (1.0 - epoch_num / max_epochs) ** 0.9
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr_
+
+            iter_num = iter_num + 1
+            writer.add_scalar('info/lr', lr_, iter_num)
+            writer.add_scalar('info/total_loss', loss, iter_num)
+            writer.add_scalar('info/loss_ce', loss_ce, iter_num)
+            writer.add_scalar('info/loss_dice', loss_dice, iter_num)
+            writer.add_scalar('info/consistency_loss',
+                              consistency_loss, iter_num)
+            writer.add_scalar('info/consistency_weight',
+                              consistency_weight, iter_num)
+
+            logging.info(
+                'iteration %d : loss : %f, loss_ce: %f, loss_dice: %f' %
+                (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
+            writer.add_scalar('loss/loss', loss, iter_num)
+
+
+        model.eval()
+
+        avg_metric = test_all_case(model, args.root_valpath, val_num=args.val_num, num_classes=2,
+                                   patch_size=args.patch_size, stride_xy=32, stride_z=64)
+        if avg_metric[:, 0].mean() > best_performance:
+            best_performance = avg_metric[:, 0].mean()
+            save_mode_path = os.path.join(snapshot_path, 'epoch_{}_dice_{}.pth'.format(
+                epoch_num, round(best_performance, 4)))
+            save_best = os.path.join(snapshot_path,
+                                     '{}_best_model.pth'.format(args.model))
+            torch.save(model.state_dict(), save_mode_path)
+            torch.save(model.state_dict(), save_best)
+
+        writer.add_scalar('info/val_dice_score',
+                          avg_metric[0, 0], iter_num)
+        writer.add_scalar('info/val_hd95',
+                          avg_metric[0, 1], iter_num)
+        logging.info('epoch %d : iteration %d : dice_score : %f hd95 : %f' % \
+                     (epoch_num, iter_num, avg_metric[0, 0].mean(), avg_metric[0, 1].mean()))
+
+        model.train()
+
+        if epoch_num >= max_epochs:
+            iterator.close()
+            break
+    writer.close()
+    return "Training Finished!"
+
+
+if __name__ == "__main__":
+    if not args.deterministic:
+        cudnn.benchmark = True
+        cudnn.deterministic = False
+    else:
+        cudnn.benchmark = False
+        cudnn.deterministic = True
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+
+    snapshot_path = "./model/{}_{}_labeled_{}_{} {} {}/{}".format(args.exp, args.labeled_num, args.total_num, \
+                            args.patch_size[0], args.patch_size[1], args.patch_size[2], args.model)
+    if not os.path.exists(snapshot_path):
+        os.makedirs(snapshot_path)
+
+    logging.basicConfig(filename=snapshot_path+"/log.txt", level=logging.INFO,
+                        format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
+    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+    logging.info(str(args))
+    train(args, snapshot_path)
